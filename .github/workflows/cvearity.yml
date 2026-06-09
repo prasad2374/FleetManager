@@ -1,0 +1,80 @@
+name: CVEarity SBOM Discovery
+
+on:
+  repository_dispatch:
+    types:
+      - cvearity_sbom_scan
+      - cvearity_iac_bom_scan
+      - cvearity_ai_bom_scan
+
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (cvearitybom)
+        run: |
+          # Pull the official image but tag it locally as cvearitybom for branding
+          docker pull ghcr.io/cyclonedx/cdxgen:latest
+          docker tag ghcr.io/cyclonedx/cdxgen:latest cvearitybom:latest
+          # Run the cvearitybom container
+          docker run --rm -v ${{ github.workspace }}:/app -w /app cvearitybom:latest -r -o bom.json .
+
+      - name: Upload SBOM
+        env:
+          SCAN_ID: ${{ github.event.client_payload.scan_id }}
+          API_URL: ${{ github.event.client_payload.api_url }}
+        run: |
+          cat << 'EOF' > cvearity_discovery.py
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+
+          def main():
+              scan_id = os.environ.get("SCAN_ID")
+              api_url = os.environ.get("API_URL")
+              output_file = "bom.json"
+              
+              print("Extracting inventory...")
+              with open(output_file, "r") as f:
+                  sbom = json.load(f)
+                  
+              components = sbom.get("components", [])
+              inventory = []
+              for comp in components:
+                  inventory.append({
+                      "name": comp.get("name"),
+                      "version": comp.get("version"),
+                      "purl": comp.get("purl"),
+                      "supplier": comp.get("supplier", {}).get("name") if isinstance(comp.get("supplier"), dict) else comp.get("supplier"),
+                      "type": comp.get("type"),
+                      "bom_ref": comp.get("bom-ref")
+                  })
+                  
+              print(f"Uploading {len(inventory)} components to {api_url}/api/inventory/upload...")
+              data = json.dumps({
+                  "scan_id": int(scan_id),
+                  "components": inventory
+              }).encode('utf-8')
+              
+              req = urllib.request.Request(f"{api_url}/api/inventory/upload", data=data, headers={'Content-Type': 'application/json'}, method='POST')
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      print("Upload successful! Status:", response.status)
+              except urllib.error.HTTPError as e:
+                  print("Upload failed:", e.code, e.reason)
+                  print(e.read().decode())
+                  exit(1)
+              except urllib.error.URLError as e:
+                  print("Failed to reach server:", e.reason)
+                  exit(1)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          
+          # Use the pre-installed system python3 to run the script natively
+          python3 cvearity_discovery.py
